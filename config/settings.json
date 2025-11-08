@@ -1,7 +1,7 @@
 {
   "api_keys": {
-    "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
-    "openai_api_key": "YOUR_OPENAI_API_KEY_HERE",
+    "gemini_api_key": "AIzaSyCRVAmJXTNf3zDnDru0U4E_aEKGHHD5VwM",
+    "openai_api_key": "",
     "azure_openai_api_key": "YOUR_AZURE_OPENAI_API_KEY_HERE",
     "azure_openai_endpoint": "YOUR_AZURE_OPENAI_ENDPOINT_HERE",
     "azure_openai_deployment": "YOUR_AZURE_OPENAI_DEPLOYMENT_NAME_HERE",
@@ -78,7 +78,7 @@
     "format": "%(asctime)s - %(levelname)s - %(module)s - %(message)s"
   },
   "browser_settings": {
-    "type": "firefox",
+    "type": "chrome",
     "headless": false,
     "user_agent_generation": "random",
     "custom_user_agent": null,

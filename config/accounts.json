@@ -1,21 +1,25 @@
 [
   {
-    "account_id": "tech_innovator_001",
+    "account_id": "iLovass2",
     "is_active": true,
-    "cookie_file_path": "config/dummy_cookies_example.json",
+    "cookie_file_path": "config/my_account_cookies.json",
     "proxy": null,
     "post_to_community": true,
-    "community_id": "1497313371053510658",
-    "community_name": "One Piece",
+    "community_id": "1762494276565426592",
+    "community_name": "AI — Rumors & Insights",
     "target_keywords_override": [
-      "Artificial General Intelligence",
-      "Large Language Models applications",
-      "AI Ethics in practice",
-      "Future of AI"
+        "Artificial General Intelligence",
+        "Large Language Models applications",
+        "AI Ethics in practice",
+        "Future of AI",
+        "No-code AI tools",
+        "LLM fine-tuning tips",
+        "AI bias mitigation"
     ],
     "competitor_profiles_override": [
-      "https://x.com/OpenAI"
-
+        "https://x.com/OpenAI",
+        "https://x.com/AnthropicAI",
+        "https://x.com/xai"
     ],
     "llm_settings_override": {
       "service_preference": "gemini",
@@ -60,7 +64,10 @@
         "Artificial General Intelligence",
         "Large Language Models applications",
         "AI Ethics in practice",
-        "Future of AI"
+        "Future of AI",
+        "No-code AI tools",
+        "LLM fine-tuning tips",
+        "AI bias mitigation"
       ],
       "enable_community_engagement": true,
       "enable_community_likes": true,

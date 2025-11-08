@@ -1,0 +1,72 @@
+[
+  {
+    "account_id": "my_first_account",
+    "is_active": true,
+    "cookie_file_path": "config/my_account_cookies.json",
+    "proxy": null,
+    
+    "post_to_community": false,
+    "community_id": null,
+    "community_name": null,
+    
+    "target_keywords_override": [
+      "Artificial Intelligence",
+      "Machine Learning",
+      "Technology News",
+      "AI Tools"
+    ],
+    
+    "competitor_profiles_override": [
+      "https://x.com/OpenAI",
+      "https://x.com/GoogleAI",
+      "https://x.com/AnthropicAI"
+    ],
+    
+    "llm_settings_override": {
+      "service_preference": "gemini",
+      "model_name_override": "gemini-2.5-flash",
+      "max_tokens": 1000,
+      "temperature": 0.7
+    },
+    
+    "action_config_override": {
+      "min_delay_between_actions_seconds": 120,
+      "max_delay_between_actions_seconds": 300,
+      
+      "enable_competitor_reposts": true,
+      "max_posts_per_competitor_run": 1,
+      "competitor_post_interaction_type": "repost",
+      "min_likes_for_repost_candidate": 10,
+      "min_retweets_for_repost_candidate": 5,
+      
+      "enable_keyword_replies": true,
+      "max_replies_per_keyword_run": 2,
+      "reply_only_to_recent_tweets_hours": 24,
+      
+      "enable_liking_tweets": true,
+      "max_likes_per_run": 5,
+      "like_tweets_from_feed": false,
+      
+      "enable_content_curation_posts": false,
+      "max_curated_posts_per_run": 1,
+      
+      "enable_thread_analysis": true,
+      
+      "enable_relevance_filter_competitor_reposts": true,
+      "relevance_threshold_competitor_reposts": 0.45,
+      
+      "enable_relevance_filter_likes": true,
+      "relevance_threshold_likes": 0.35,
+      
+      "enable_relevance_filter_keyword_replies": false,
+      "relevance_threshold_keyword_replies": 0.6,
+      
+      "llm_settings_for_post": {
+        "service_preference": "gemini",
+        "model_name_override": "gemini-2.5-flash",
+        "max_tokens": 150,
+        "temperature": 0.72
+      }
+    }
+  }
+]
