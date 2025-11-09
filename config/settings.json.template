@@ -1,7 +1,7 @@
 {
   "api_keys": {
-    "gemini_api_key": "AIzaSyCRVAmJXTNf3zDnDru0U4E_aEKGHHD5VwM",
-    "openai_api_key": "",
+    "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
+    "openai_api_key": "YOUR_OPENAI_API_KEY_HERE",
     "azure_openai_api_key": "YOUR_AZURE_OPENAI_API_KEY_HERE",
     "azure_openai_endpoint": "YOUR_AZURE_OPENAI_ENDPOINT_HERE",
     "azure_openai_deployment": "YOUR_AZURE_OPENAI_DEPLOYMENT_NAME_HERE",
@@ -56,7 +56,7 @@
       "enable_thread_analysis": true,
       "llm_settings_for_post": {
         "service_preference": "gemini",
-        "model_name_override": "gemini-2.5-flash",
+        "model_name_override": "gemini-2.5-pro",
         "max_tokens": 150,
         "temperature": 0.7
       },
@@ -67,7 +67,7 @@
       },
       "llm_settings_for_thread_analysis": {
         "service_preference": "gemini",
-        "model_name_override": "gemini-2.5-flash",
+        "model_name_override": "gemini-2.5-pro",
         "max_tokens": 50,
         "temperature": 0.1
       }

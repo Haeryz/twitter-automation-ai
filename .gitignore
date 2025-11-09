@@ -163,18 +163,33 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 
-# Config files with sensitive information
+# Config files with sensitive information (actual user data)
 config/accounts.json
-# Consider adding settings.json if it contains sensitive API keys not managed by .env
-# config/settings.json
-# Or provide a template like config/settings.example.json
+config/settings.json
+config/*_cookies.json
+config/*.cookie
+# Keep templates
+!config/accounts.json.template
+!config/settings.json.template
 
-# Project specific
-media_files/
+# Project specific - User data
+media_files/*
+!media_files/.gitkeep
 processed_tweets_log.csv
-*.cookie
-*.json # If other json files with sensitive data might be created, otherwise be more specific
-# Example: cookies_*.json
+
+# Data directory - User specific data only
+data/metrics/*
+!data/metrics/.gitkeep
+data/style_memory/*
+!data/style_memory/.gitkeep
+data/proxy_pools_state.json
+data/cookies/*
+!data/cookies/dummy_cookies_example.json
+
+# Logs - All user-generated logs
+logs/**/*
+!logs/.gitkeep
+!logs/accounts/.gitkeep
 
 # Backup files
 *.bak
