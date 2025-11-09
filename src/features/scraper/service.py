@@ -71,8 +71,12 @@ class TweetScraper:
     ) -> List[ScrapedTweet]:
         if max_tweets is None:
             max_tweets = self.default_max_tweets
+        if max_tweets is None:
+            max_tweets = 50
         if stop_if_no_new_tweets_count is None:
             stop_if_no_new_tweets_count = self.no_new_tweets_scroll_limit
+        if stop_if_no_new_tweets_count is None:
+            stop_if_no_new_tweets_count = 5
 
         logger.info(
             "Navigating to %s for scraping (%s). Max tweets: %s",
@@ -87,16 +91,16 @@ class TweetScraper:
         seen_tweet_ids = set()
         scroll_attempts_with_no_new_tweets = 0
 
-        progress = Progress(max_tweets, description=f"Scraping {search_type}", unit="tweets")
+        progress = Progress(int(max_tweets), description=f"Scraping {search_type}", unit="tweets")
         progress.set_progress(0, status_message="Starting")
 
-        while len(scraped_tweets) < max_tweets:
+        while len(scraped_tweets) < int(max_tweets):
             try:
                 tweet_card_elements = self._get_tweet_cards_from_page()
                 if not tweet_card_elements:
                     logger.info("No tweet card elements found on the page.")
                     scroll_attempts_with_no_new_tweets += 1
-                    if scroll_attempts_with_no_new_tweets >= stop_if_no_new_tweets_count:
+                    if scroll_attempts_with_no_new_tweets >= int(stop_if_no_new_tweets_count):
                         logger.info(
                             "No new tweets found after %s scrolls. Stopping.",
                             stop_if_no_new_tweets_count,
@@ -109,28 +113,37 @@ class TweetScraper:
 
                 new_tweets_found_this_scroll = 0
                 for card_el in tweet_card_elements:
-                    if len(scraped_tweets) >= max_tweets:
+                    if len(scraped_tweets) >= int(max_tweets):
                         break
+
+                    parsed_tweet = parse_tweet_card(card_el, logger)
+                    if not parsed_tweet:
+                        continue
+
+                    tweet_id = getattr(parsed_tweet, 'tweet_id', None)
+                    tweet_id_str = str(tweet_id) if tweet_id is not None else None
+                    if tweet_id_str and tweet_id_str in seen_tweet_ids:
+                        continue
 
                     try:
                         self.driver.execute_script(
-                            "arguments[0].scrollIntoView({block: 'center'});", card_el
+                            "arguments[0].scrollIntoView({block: 'nearest', inline: 'nearest'});",
+                            card_el,
                         )
-                        time.sleep(0.2)
+                        time.sleep(0.1)
                     except Exception as scroll_err:
                         logger.debug(
                             "Could not scroll tweet card into view: %s", scroll_err
                         )
 
-                    parsed_tweet = parse_tweet_card(card_el, logger)
-                    if parsed_tweet and parsed_tweet.tweet_id not in seen_tweet_ids:
-                        scraped_tweets.append(parsed_tweet)
-                        seen_tweet_ids.add(parsed_tweet.tweet_id)
-                        new_tweets_found_this_scroll += 1
-                        progress.set_progress(
-                            len(scraped_tweets),
-                            status_message=f"Found {len(scraped_tweets)}",
-                        )
+                    scraped_tweets.append(parsed_tweet)
+                    if tweet_id_str:
+                        seen_tweet_ids.add(tweet_id_str)
+                    new_tweets_found_this_scroll += 1
+                    progress.set_progress(
+                        len(scraped_tweets),
+                        status_message=f"Found {len(scraped_tweets)}",
+                    )
 
                 if new_tweets_found_this_scroll == 0:
                     scroll_attempts_with_no_new_tweets += 1
@@ -142,7 +155,7 @@ class TweetScraper:
                 else:
                     scroll_attempts_with_no_new_tweets = 0
 
-                if scroll_attempts_with_no_new_tweets >= stop_if_no_new_tweets_count:
+                if scroll_attempts_with_no_new_tweets >= int(stop_if_no_new_tweets_count):
                     logger.info(
                         "Stopping scrape for %s: No new tweets after %s consecutive empty scrolls.",
                         url,
@@ -150,7 +163,7 @@ class TweetScraper:
                     )
                     break
 
-                if len(scraped_tweets) >= max_tweets:
+                if len(scraped_tweets) >= int(max_tweets):
                     logger.info("Reached max_tweets (%s) for %s.", max_tweets, url)
                     break
 
@@ -186,6 +199,10 @@ class TweetScraper:
         clean_hashtag = hashtag.lstrip('#')
         hashtag_url = f"https://x.com/hashtag/{clean_hashtag}?f=live"
         return self.scrape_tweets_from_url(hashtag_url, "hashtag", max_tweets)
+
+    def scrape_home_timeline(self, max_tweets: Optional[int] = None) -> List[ScrapedTweet]:
+        """Scrape tweets from the logged-in account's home timeline."""
+        return self.scrape_tweets_from_url("https://x.com/home", "home", max_tweets)
 
 
 if __name__ == "__main__":

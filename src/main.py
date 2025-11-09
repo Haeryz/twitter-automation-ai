@@ -4,12 +4,14 @@ import sys
 import os
 import time
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Any, Dict, List
 
 # Ensure src directory is in Python path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from core.config_loader import ConfigLoader
+from core.config_loader import ConfigLoader, PROJECT_ROOT
 from core.browser_manager import BrowserManager
 from core.llm_service import LLMService
 from utils.logger import setup_logger
@@ -17,6 +19,8 @@ from utils.file_handler import FileHandler
 from data_models import AccountConfig, TweetContent, LLMSettings, ScrapedTweet, ActionConfig
 from features.scraper import TweetScraper
 from features.publisher import TweetPublisher
+from features.publisher.reply_generator import generate_guarded_reply, should_apply_style_profile
+from features.publisher.style_utils import build_style_snapshot
 from features.engagement import TweetEngagement
 from features.analyzer import TweetAnalyzer
 from utils.metrics import MetricsRecorder
@@ -65,6 +69,465 @@ class TwitterOrchestrator:
             return handle in candidates and handle != ""
         except Exception:
             return False
+
+    async def _build_style_context(
+        self,
+        scraper: TweetScraper,
+        browser_manager: BrowserManager,
+        account: AccountConfig,
+        max_items: int = 10,
+    ):
+        def _normalize_handle(raw_value):
+            if not raw_value:
+                return None
+            value = str(raw_value).strip()
+            if not value:
+                return None
+            if value.lower().startswith("https://"):
+                parts = value.split("x.com/")
+                if len(parts) > 1:
+                    value = parts[-1]
+            value = value.split('?')[0].strip('/').lstrip('@')
+            return value.lower() or None
+
+        handle_candidates = []
+        if getattr(browser_manager, 'logged_in_handle', None):
+            handle_candidates.append(browser_manager.logged_in_handle)
+        if account.self_handles:
+            handle_candidates.extend([h for h in account.self_handles if h])
+        handle_candidates.append(account.account_id)
+
+        normalized_handles = []
+        seen_handles = set()
+        for raw in handle_candidates:
+            normalized = _normalize_handle(raw)
+            if normalized and normalized not in seen_handles:
+                seen_handles.add(normalized)
+                normalized_handles.append(normalized)
+
+        tweets_collected = []
+        profile_used = None
+        for handle in normalized_handles:
+            profile_url = f"https://x.com/{handle}"
+            try:
+                tweets = await asyncio.to_thread(
+                    scraper.scrape_tweets_from_profile,
+                    profile_url,
+                    max_tweets=max(max_items * 2, 20),
+                )
+            except Exception as scrape_error:
+                logger.error(f"[{account.account_id}] Failed to scrape profile {profile_url} for style context: {scrape_error}", exc_info=True)
+                continue
+            valid = [t for t in tweets if t and getattr(t, 'text_content', None)]
+            if valid:
+                tweets_collected = valid
+                profile_used = profile_url
+                break
+
+        if not tweets_collected:
+            logger.warning(f"[{account.account_id}] Unable to gather recent tweets for style context.")
+            return "", {}
+
+        seen_ids = set()
+        unique_tweets = []
+        for tweet in tweets_collected:
+            tweet_id = getattr(tweet, 'tweet_id', None)
+            if not tweet_id or tweet_id in seen_ids:
+                continue
+            seen_ids.add(tweet_id)
+            unique_tweets.append(tweet)
+
+        if not unique_tweets:
+            return "", {}
+
+        style_context_text, style_memory = build_style_snapshot(
+            unique_tweets,
+            normalized_handles,
+            max_items=max_items,
+        )
+        if not style_memory:
+            return "", {}
+
+        style_memory.update(
+            {
+                'account_id': account.account_id,
+                'profile_url': str(profile_used) if profile_used else None,
+            }
+        )
+
+        try:
+            style_memory_dir = Path(PROJECT_ROOT) / 'data' / 'style_memory'
+            self.file_handler.ensure_directory_exists(style_memory_dir)
+            style_memory_path = style_memory_dir / f"{account.account_id}.json"
+            self.file_handler.write_json(style_memory_path, style_memory)
+            logger.info(
+                f"[{account.account_id}] Refreshed style memory with {len(style_memory.get('entries', []))} entries."
+            )
+        except Exception as write_error:
+            logger.error(f"[{account.account_id}] Failed to persist style memory: {write_error}", exc_info=True)
+
+        return style_context_text, style_memory
+
+    @staticmethod
+    def _score_home_timeline_tweet(tweet: ScrapedTweet) -> float:
+        """Generate a simple popularity score combining likes, retweets, replies, and views."""
+        likes = tweet.like_count or 0
+        retweets = tweet.retweet_count or 0
+        replies = tweet.reply_count or 0
+        views = tweet.view_count or 0
+        return (likes * 2.5) + (retweets * 3.0) + (replies * 1.2) + (views * 0.001)
+
+    async def _run_home_timeline_replies(
+        self,
+        scraper: TweetScraper,
+        publisher: TweetPublisher,
+        llm_service: LLMService,
+        browser_manager: BrowserManager,
+        account: AccountConfig,
+        action_config: ActionConfig,
+        llm_for_reply: LLMSettings,
+        metrics: MetricsRecorder,
+    ) -> None:
+        replies_per_hour = max(1, action_config.home_timeline_replies_per_hour or 10)
+        max_hours = max(1, action_config.home_timeline_max_hours or 3)
+        total_cap = replies_per_hour * max_hours
+        min_delay = max(10, action_config.min_delay_between_actions_seconds)
+        max_delay = max(min_delay, action_config.max_delay_between_actions_seconds)
+
+        session_start = datetime.now(timezone.utc)
+        session_end = session_start + timedelta(hours=max_hours)
+        current_hour_start = session_start
+        replies_sent_total = 0
+        replies_this_hour = 0
+
+        logger.info(
+            f"[{account.account_id}] Starting home timeline reply session: up to {replies_per_hour} replies/hour, max {max_hours} hours ({total_cap} replies cap)."
+        )
+
+        style_context_text = ""
+        style_metadata = {}
+        style_system_prompt = None
+        try:
+            style_context_text, style_metadata = await self._build_style_context(scraper, browser_manager, account)
+            entries_count = len(style_metadata.get('entries', [])) if style_metadata else 0
+            if entries_count:
+                media_entry_count = style_metadata.get('media_entry_count', 0)
+                logger.info(
+                    f"[{account.account_id}] Loaded style context with {entries_count} recent posts (media in {media_entry_count}) from {style_metadata.get('profile_url')}.")
+                if metrics:
+                    metrics.log_event(
+                        'style_memory_refresh',
+                        'success',
+                        {
+                            'entries': entries_count,
+                            'media_entries': media_entry_count,
+                            'profile_url': style_metadata.get('profile_url'),
+                        },
+                    )
+        except Exception as style_error:
+            logger.error(f"[{account.account_id}] Failed to prepare style context: {style_error}", exc_info=True)
+            style_context_text = ""
+            style_metadata = {}
+            if metrics:
+                metrics.log_event(
+                    'style_memory_refresh',
+                    'failure',
+                    {
+                        'reason': str(style_error)[:200],
+                    },
+                )
+
+        style_summary = style_metadata.get('style_summary') if style_metadata else None
+        style_keywords = style_metadata.get('keyword_signature', []) if style_metadata else []
+
+        media_references = ""
+        inline_media_payload: List[Dict[str, Any]] = []
+        if style_metadata:
+            media_entries = [entry for entry in style_metadata.get('entries', []) if entry.get('media_urls')]
+            if media_entries:
+                lines = []
+                for entry in media_entries[:5]:
+                    media_urls = [str(url) for url in entry.get('media_urls') or [] if url]
+                    if not media_urls:
+                        continue
+                    lines.append(
+                        "Media reference: " + ", ".join(media_urls)
+                    )
+                    existing_urls = {
+                        str(part['source']['url'])
+                        for media in inline_media_payload
+                        for part in media.get('parts', [])
+                        if part.get('type') == 'media'
+                        and isinstance(part.get('source'), dict)
+                        and part['source'].get('type') == 'url'
+                        and part['source'].get('url')
+                    }
+                    for media_url in media_urls:
+                        media_url_str = str(media_url)
+                        if media_url_str in existing_urls:
+                            continue
+                        inline_media_payload.append(
+                            {
+                                'role': 'user',
+                                'parts': [
+                                    {'type': 'text', 'text': f"Reference post media ({entry.get('tweet_id', 'unknown')}):"},
+                                    {'type': 'media', 'media_type': 'image', 'source': {'type': 'url', 'url': media_url_str}},
+                                ],
+                            }
+                        )
+                        existing_urls.add(media_url_str)
+                        if len(inline_media_payload) >= 4:
+                            break
+                    if len(inline_media_payload) >= 4:
+                        break
+                if lines:
+                    media_references = "\n" + "\n".join(lines)
+
+        style_owner_handle = (
+            style_metadata.get('primary_handle')
+            if style_metadata else None
+        ) or getattr(browser_manager, 'logged_in_handle', None) or account.account_id
+        style_owner_handle = str(style_owner_handle).lstrip('@') if style_owner_handle else account.account_id
+
+        base_system_prompt = (
+            f"You are @{style_owner_handle}. Reply directly to the provided tweet. "
+            f"Keep responses under 270 characters, natural, and explicitly about the tweet's content."
+        )
+
+        template = (
+            account.action_config.style_prompt_template
+            if account.action_config and account.action_config.style_prompt_template
+            else None
+        )
+        if template:
+            context_for_template = style_summary or style_context_text or "No recent style context available."
+            try:
+                style_system_prompt = template.format(
+                    handle=style_owner_handle,
+                    style_context=context_for_template,
+                    media_references=media_references,
+                    account_id=account.account_id,
+                )
+            except Exception as template_error:
+                logger.error(
+                    f"[{account.account_id}] Failed to apply custom style_prompt_template: {template_error}",
+                    exc_info=True,
+                )
+                style_system_prompt = base_system_prompt
+        else:
+            style_system_prompt = base_system_prompt
+
+        per_reply_target_seconds = 3600.0 / float(replies_per_hour)
+        spacing_min_seconds = max(float(min_delay), per_reply_target_seconds)
+        spacing_max_candidate = float(max_delay)
+        if spacing_max_candidate < spacing_min_seconds:
+            spacing_max_seconds = spacing_min_seconds + max(30.0, spacing_min_seconds * 0.15)
+        else:
+            spacing_max_seconds = spacing_max_candidate
+        if spacing_max_seconds - spacing_min_seconds < 1.0:
+            spacing_max_seconds = spacing_min_seconds + max(5.0, spacing_min_seconds * 0.05)
+
+        next_reply_earliest = datetime.now(timezone.utc)
+        logger.info(
+            f"[{account.account_id}] Pacing replies with at least {spacing_min_seconds:.0f}s (~{spacing_min_seconds / 60.0:.1f} min) between attempts."
+        )
+
+        while replies_sent_total < total_cap:
+            now = datetime.now(timezone.utc)
+            if now >= session_end:
+                logger.info(f"[{account.account_id}] Home timeline session reached {max_hours} hour limit, stopping.")
+                break
+
+            if (now - current_hour_start).total_seconds() >= 3600:
+                logger.debug(f"[{account.account_id}] Advancing to next hourly window for home timeline replies.")
+                current_hour_start = now
+                replies_this_hour = 0
+
+            if replies_this_hour >= replies_per_hour:
+                next_hour_time = current_hour_start + timedelta(hours=1)
+                sleep_seconds = (next_hour_time - now).total_seconds()
+                remaining_session = (session_end - now).total_seconds()
+                if remaining_session <= 0:
+                    logger.info(f"[{account.account_id}] Session time exhausted while waiting for next hour.")
+                    break
+                sleep_seconds = max(0.0, min(sleep_seconds, remaining_session))
+                if sleep_seconds <= 0:
+                    current_hour_start = datetime.now(timezone.utc)
+                    replies_this_hour = 0
+                    continue
+                minutes = sleep_seconds / 60.0
+                logger.info(
+                    f"[{account.account_id}] Reached hourly cap ({replies_per_hour}). Cooling down for {minutes:.1f} minutes before resuming."
+                )
+                await asyncio.sleep(sleep_seconds)
+                next_reply_earliest = max(next_reply_earliest, datetime.now(timezone.utc))
+                current_hour_start = datetime.now(timezone.utc)
+                replies_this_hour = 0
+                continue
+
+            batch_limit = max(40, replies_per_hour * 4)
+            tweets = await asyncio.to_thread(
+                scraper.scrape_home_timeline,
+                batch_limit,
+            )
+
+            if not tweets:
+                logger.info(f"[{account.account_id}] No tweets retrieved from home timeline. Ending session early.")
+                break
+
+            scored_candidates = sorted(
+                tweets,
+                key=self._score_home_timeline_tweet,
+                reverse=True,
+            )
+
+            made_reply_this_batch = False
+
+            for candidate in scored_candidates:
+                if replies_this_hour >= replies_per_hour or replies_sent_total >= total_cap:
+                    break
+
+                if not candidate.tweet_id:
+                    continue
+
+                if candidate.user_handle and self._is_own_tweet(candidate.user_handle, account, browser_manager):
+                    continue
+
+                action_key = f"home_reply_{account.account_id}_{candidate.tweet_id}"
+                if action_key in self.processed_action_keys:
+                    continue
+
+                tweet_inline_media = []
+                if candidate.embedded_media_urls:
+                    for media_url in candidate.embedded_media_urls[:4]:  # Limit to 4 media items
+                        tweet_inline_media.append(
+                            {
+                                'role': 'user',
+                                'parts': [
+                                    {'type': 'text', 'text': "Media from the tweet you're replying to:"},
+                                    {'type': 'media', 'media_type': 'image', 'source': {'type': 'url', 'url': str(media_url)}},
+                                ],
+                            }
+                        )
+
+                use_style_profile = should_apply_style_profile(candidate, style_keywords)
+                system_prompt_for_reply = style_system_prompt if use_style_profile else base_system_prompt
+                summary_for_reply = style_summary if use_style_profile else None
+
+                try:
+                    generated_reply_text, guard_metadata = await generate_guarded_reply(
+                        llm_service=llm_service,
+                        tweet=candidate,
+                        llm_settings=llm_for_reply,
+                        system_prompt=system_prompt_for_reply,
+                        style_summary=summary_for_reply,
+                        persona_handle=style_owner_handle,
+                        inline_media=tweet_inline_media,
+                        banned_terms=None,
+                        retry_limit=2,
+                    )
+                except Exception as llm_error:
+                    logger.error(f"[{account.account_id}] LLM failed to generate reply for {candidate.tweet_id}: {llm_error}")
+                    metrics.increment('errors')
+                    metrics.log_event(
+                        'home_timeline_reply',
+                        'failure',
+                        {'tweet_id': candidate.tweet_id, 'reason': 'llm_error'},
+                    )
+                    continue
+
+                if not generated_reply_text:
+                    logger.debug(
+                        f"[{account.account_id}] Guardrails blocked reply for tweet {candidate.tweet_id}: {guard_metadata.get('relevance_reason')}"
+                    )
+                    metrics.log_event(
+                        'home_timeline_reply',
+                        'skipped',
+                        {
+                            'tweet_id': candidate.tweet_id,
+                            'reason': guard_metadata.get('relevance_reason'),
+                            'attempts': guard_metadata.get('attempts'),
+                        },
+                    )
+                    continue
+
+                generated_reply_text = generated_reply_text[:270].rstrip()
+                if not generated_reply_text:
+                    logger.debug(
+                        f"[{account.account_id}] Generated reply empty after trimming for tweet {candidate.tweet_id}. Skipping."
+                    )
+                    metrics.log_event(
+                        'home_timeline_reply',
+                        'skipped',
+                        {
+                            'tweet_id': candidate.tweet_id,
+                            'reason': 'empty_after_trim',
+                            'attempts': guard_metadata.get('attempts'),
+                        },
+                    )
+                    continue
+
+                now_for_pacing = datetime.now(timezone.utc)
+                if now_for_pacing < next_reply_earliest:
+                    wait_seconds = (next_reply_earliest - now_for_pacing).total_seconds()
+                    if wait_seconds > 0:
+                        logger.info(
+                            f"[{account.account_id}] Waiting {wait_seconds / 60.0:.1f} minutes before next reply to honor pacing."
+                        )
+                        await asyncio.sleep(wait_seconds)
+
+                logger.info(
+                    f"[{account.account_id}] Attempting home timeline reply {replies_sent_total + 1}/{total_cap} "
+                    f"(hour slot {replies_this_hour + 1}/{replies_per_hour}) on tweet {candidate.tweet_id}."
+                )
+
+                success = await publisher.reply_to_tweet(candidate, generated_reply_text)
+                attempt_completed_at = datetime.now(timezone.utc)
+                next_delay = random.uniform(spacing_min_seconds, spacing_max_seconds)
+                next_reply_earliest = attempt_completed_at + timedelta(seconds=next_delay)
+                logger.debug(
+                    f"[{account.account_id}] Scheduled next reply attempt no sooner than {next_reply_earliest.isoformat()} (delay {next_delay:.0f}s)."
+                )
+                if success:
+                    score = self._score_home_timeline_tweet(candidate)
+                    replies_sent_total += 1
+                    replies_this_hour += 1
+                    metrics.increment('replies')
+                    metrics.log_event(
+                        'home_timeline_reply',
+                        'success',
+                        {
+                            'tweet_id': candidate.tweet_id,
+                            'score': score,
+                            'likes': candidate.like_count,
+                            'retweets': candidate.retweet_count,
+                            'views': candidate.view_count,
+                            'media_in_style_context': bool(media_references.strip()),
+                            'style_applied': use_style_profile,
+                            'guard_attempts': guard_metadata.get('attempts'),
+                            'flagged_terms': guard_metadata.get('flagged_terms'),
+                        },
+                    )
+                    log_index = f"{replies_sent_total}/{total_cap}"
+                    logger.info(
+                        f"[{account.account_id}] Home timeline reply {log_index} complete for tweet {candidate.tweet_id} (score {score:.2f})."
+                    )
+                    self.file_handler.save_processed_action_key(action_key, timestamp=datetime.now().isoformat())
+                    self.processed_action_keys.add(action_key)
+                    made_reply_this_batch = True
+                    break
+                else:
+                    metrics.increment('errors')
+                    metrics.log_event(
+                        'home_timeline_reply',
+                        'failure',
+                        {'tweet_id': candidate.tweet_id, 'reason': 'selenium_failure'},
+                    )
+                    logger.error(f"[{account.account_id}] Failed to post reply to home timeline tweet {candidate.tweet_id}.")
+
+            if not made_reply_this_batch:
+                logger.info(f"[{account.account_id}] No suitable home timeline tweets produced replies this batch. Ending session.")
+                break
 
     async def _decide_competitor_action(self, analyzer: TweetAnalyzer, tweet: ScrapedTweet, account: AccountConfig) -> str:
         """Return one of: 'repost', 'retweet', 'quote_tweet', 'like' based on relevance and sentiment, honoring per-account overrides and thresholds."""
@@ -152,6 +615,7 @@ class TwitterOrchestrator:
         logger.info(f"--- Starting processing for account: {account.account_id} ---")
         
         browser_manager = None
+        metrics = None
         try:
             browser_manager = BrowserManager(account_config=account_dict) # Pass original dict for cookie path handling
             llm_service = LLMService(config_loader=self.config_loader)
@@ -179,11 +643,38 @@ class TwitterOrchestrator:
             llm_for_reply = account.llm_settings_override or current_action_config.llm_settings_for_reply
             llm_for_thread_analysis = account.llm_settings_override or current_action_config.llm_settings_for_thread_analysis
             
-            # Action 1: Scrape competitor profiles and generate/post new tweets
-            # Content sources are now directly from the account config, defaulting to empty lists if not provided.
+            # Determine automation mode for inbound content
             competitor_profiles_for_account = account.competitor_profiles
+            home_timeline_enabled = (
+                current_action_config.enable_home_timeline_replies
+                if current_action_config.enable_home_timeline_replies is not None
+                else False
+            )
+
+            if home_timeline_enabled:
+                await self._run_home_timeline_replies(
+                    scraper,
+                    publisher,
+                    llm_service,
+                    browser_manager,
+                    account,
+                    current_action_config,
+                    llm_for_reply,
+                    metrics,
+                )
+                logger.info(
+                    f"[{account.account_id}] Home timeline only mode active; skipping all other automation tasks."
+                )
+                return
+
+            # Action 1: Scrape competitor profiles and generate/post new tweets (only when allowed)
+            # Content sources are now directly from the account config, defaulting to empty lists if not provided.
             
-            if current_action_config.enable_competitor_reposts and competitor_profiles_for_account:
+            if (
+                current_action_config.enable_competitor_reposts
+                and competitor_profiles_for_account
+                and not home_timeline_enabled
+            ):
                 logger.info(f"[{account.account_id}] Starting competitor profile scraping and posting using {len(competitor_profiles_for_account)} profiles.")
                 for profile_url in competitor_profiles_for_account:
                     logger.info(f"[{account.account_id}] Scraping profile: {str(profile_url)}")
@@ -216,10 +707,10 @@ class TwitterOrchestrator:
                         if current_action_config.repost_only_tweets_with_media and not scraped_tweet.embedded_media_urls:
                             logger.debug(f"[{account.account_id}] Skipping tweet {scraped_tweet.tweet_id} (no media).")
                             continue
-                        if scraped_tweet.like_count < current_action_config.min_likes_for_repost_candidate:
+                        if (scraped_tweet.like_count or 0) < current_action_config.min_likes_for_repost_candidate:
                             logger.debug(f"[{account.account_id}] Skipping tweet {scraped_tweet.tweet_id} (likes {scraped_tweet.like_count} < min).")
                             continue
-                        if scraped_tweet.retweet_count < current_action_config.min_retweets_for_repost_candidate:
+                        if (scraped_tweet.retweet_count or 0) < current_action_config.min_retweets_for_repost_candidate:
                             logger.debug(f"[{account.account_id}] Skipping tweet {scraped_tweet.tweet_id} (retweets {scraped_tweet.retweet_count} < min).")
                             continue
 
@@ -292,9 +783,9 @@ class TwitterOrchestrator:
                         else:
                             logger.error(f"[{account.account_id}] Failed to {interaction_type} based on tweet {scraped_tweet.tweet_id}")
                             metrics.increment('errors')
-            
-            elif current_action_config.enable_competitor_reposts:
-                 logger.info(f"[{account.account_id}] Competitor reposts enabled, but no competitor profiles configured for this account.")
+
+            elif current_action_config.enable_competitor_reposts and not home_timeline_enabled:
+                logger.info(f"[{account.account_id}] Competitor reposts enabled, but no competitor profiles configured for this account.")
 
             # Action 1.5: Engage with posts inside a configured Community
             if (
@@ -348,7 +839,7 @@ class TwitterOrchestrator:
                             if action_key in self.processed_action_keys:
                                 continue
                             logger.info(f"[{account.account_id}] Liking community post {ct.tweet_id}")
-                            interaction_success = await engagement.like_tweet(ct.tweet_id, ct.tweet_url)
+                            interaction_success = await engagement.like_tweet(ct.tweet_id, str(ct.tweet_url) if ct.tweet_url else None)
                             metrics.log_event('community_like', 'success' if interaction_success else 'failure', {'tweet_id': ct.tweet_id})
                             if interaction_success:
                                 metrics.increment('likes')
@@ -404,10 +895,25 @@ class TwitterOrchestrator:
                                         except Exception:
                                             pass
                                         continue
-                                    # Generate a concise reply
+                                    # Build context-aware reply prompt with proper media handling
+                                    tweet_media_context = ""
+                                    tweet_inline_media = []
+                                    if ct.embedded_media_urls:
+                                        media_count = len(ct.embedded_media_urls)
+                                        tweet_media_context = f"\n[This tweet contains {media_count} media item(s)]"
+                                        for media_url in ct.embedded_media_urls[:4]:
+                                            tweet_inline_media.append({
+                                                'role': 'user',
+                                                'parts': [
+                                                    {'type': 'text', 'text': f"Media from the community tweet:"},
+                                                    {'type': 'media', 'media_type': 'image', 'source': {'type': 'url', 'url': str(media_url)}},
+                                                ],
+                                            })
+
                                     reply_prompt = (
-                                        f"Write a concise, natural reply under 270 characters. Avoid hashtags, links, emojis.\n\n"
-                                        f"Original post by @{ct.user_handle or 'user'}:\n\"{ct.text_content}\"\n\nYour reply:"
+                                        f"TASK: Write a concise, natural reply under 270 characters that is DIRECTLY RELEVANT to this community post.{tweet_media_context}\n\n"
+                                        f"Post by @{ct.user_handle or 'user'}:\n\"{ct.text_content}\"\n\n"
+                                        f"Your reply (stay on-topic, avoid hashtags/links/emojis):"
                                     )
                                     logger.info(f"[{account.account_id}] Replying to community post {ct.tweet_id}")
                                     generated_reply_text = await llm_service.generate_text(
@@ -416,6 +922,7 @@ class TwitterOrchestrator:
                                         model_name=llm_for_reply.model_name_override,
                                         max_tokens=llm_for_reply.max_tokens,
                                         temperature=llm_for_reply.temperature,
+                                        inline_media=tweet_inline_media,
                                     )
                                     generated_reply_text = (generated_reply_text or "")[:270].rstrip()
                                     if generated_reply_text:
@@ -478,15 +985,30 @@ class TwitterOrchestrator:
                             scraped_tweet_to_reply.is_confirmed_thread = is_confirmed
                             logger.info(f"[{account.account_id}] Thread analysis for reply target {scraped_tweet_to_reply.tweet_id}: {is_confirmed}")
 
-                        # Generate reply text (explicitly constrain length and style)
+                        # Build context-aware reply prompt with proper media handling
+                        tweet_media_context = ""
+                        tweet_inline_media = []
+                        if scraped_tweet_to_reply.embedded_media_urls:
+                            media_count = len(scraped_tweet_to_reply.embedded_media_urls)
+                            tweet_media_context = f"\n[This tweet contains {media_count} media item(s)]"
+                            for media_url in scraped_tweet_to_reply.embedded_media_urls[:4]:
+                                tweet_inline_media.append({
+                                    'role': 'user',
+                                    'parts': [
+                                        {'type': 'text', 'text': f"Media from the tweet you're replying to:"},
+                                        {'type': 'media', 'media_type': 'image', 'source': {'type': 'url', 'url': str(media_url)}},
+                                    ],
+                                })
+
                         reply_prompt_context = (
                             "This tweet is part of a thread." if scraped_tweet_to_reply.is_confirmed_thread else "This is a standalone tweet."
                         )
                         reply_prompt = (
-                            f"Write a concise, natural reply under 270 characters. {reply_prompt_context} "
-                            f"Avoid hashtags, links, and emojis unless essential. One short paragraph.\n\n"
-                            f"Original tweet by @{scraped_tweet_to_reply.user_handle or 'user'}:\n"
-                            f"\"{scraped_tweet_to_reply.text_content}\"\n\nYour reply:"
+                            f"TASK: Write a concise, natural reply under 270 characters that is DIRECTLY RELEVANT to this tweet. "
+                            f"{reply_prompt_context}{tweet_media_context}\n\n"
+                            f"Tweet by @{scraped_tweet_to_reply.user_handle or 'user'}:\n"
+                            f"\"{scraped_tweet_to_reply.text_content}\"\n\n"
+                            f"Your reply (stay on-topic, avoid hashtags/links/emojis):"
                         )
                         
                         logger.info(f"[{account.account_id}] Generating reply for tweet {scraped_tweet_to_reply.tweet_id}...")
@@ -495,7 +1017,8 @@ class TwitterOrchestrator:
                             service_preference=llm_for_reply.service_preference,
                             model_name=llm_for_reply.model_name_override,
                             max_tokens=llm_for_reply.max_tokens,
-                            temperature=llm_for_reply.temperature
+                            temperature=llm_for_reply.temperature,
+                            inline_media=tweet_inline_media,
                         )
 
                         if not generated_reply_text:
@@ -660,10 +1183,11 @@ class TwitterOrchestrator:
         finally:
             if browser_manager:
                 browser_manager.close_driver()
-            try:
-                metrics.mark_run_finish()
-            except Exception:
-                pass
+            if metrics is not None:
+                try:
+                    metrics.mark_run_finish()
+                except Exception:
+                    pass
             # Safely log account ID
             account_id_for_log = account_dict.get('account_id', 'UnknownAccount')
             if 'account' in locals() and hasattr(account, 'account_id'):

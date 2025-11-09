@@ -1,7 +1,48 @@
 import logging
 from typing import Optional, Dict, Any, List
 
+try:  # LangChain 0.2+ exposes messages via langchain_core
+    from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
+except ImportError:  # pragma: no cover - fall back for older langchain versions
+    from langchain.schema import HumanMessage, SystemMessage, AIMessage, BaseMessage  # type: ignore
+
 logger = logging.getLogger(__name__)
+
+
+def _build_user_content(prompt: str, inline_media: List[Dict[str, Any]]) -> Any:  # type: ignore[valid-type]
+    text_prompt = (prompt or "").strip()
+    if not inline_media:
+        return text_prompt
+
+    content: List[Dict[str, Any]] = []
+    if text_prompt:
+        content.append({"type": "text", "text": text_prompt})
+
+    for media in inline_media:
+        parts = media.get('parts', []) if isinstance(media, dict) else []
+        for part in parts:
+            part_type = part.get('type') if isinstance(part, dict) else None
+            if part_type == 'text':
+                text_value = str(part.get('text', '')).strip()
+                if text_value:
+                    content.append({"type": "text", "text": text_value})
+            elif part_type == 'media':
+                source = part.get('source') if isinstance(part, dict) else None
+                if not isinstance(source, dict):
+                    continue
+                url = source.get('url')
+                if not url:
+                    continue
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": str(url)},
+                })
+
+    if not content:
+        fallback_text = text_prompt or "Please respond appropriately to the provided media."
+        content.append({"type": "text", "text": fallback_text})
+
+    return content
 
 
 class TextGenerator:
@@ -46,17 +87,49 @@ class TextGenerator:
             if 'max_tokens' not in final_params:
                 final_params['max_tokens'] = self.llm_settings.get('default_max_tokens', 250)
 
+            inline_media_payload: List[Dict[str, Any]] = final_params.pop('inline_media', []) or []
+
             try:
                 if service_name == 'gemini' and self.gemini_client:
-                    model_to_use = final_params.pop('model', service_config.get('model', 'gemini-2.5-flash'))
+                    model_to_use = final_params.pop('model', service_config.get('model', 'gemini-2.5-pro'))
                     if 'max_tokens' in final_params and 'max_output_tokens' not in final_params:
                         final_params['max_output_tokens'] = final_params.pop('max_tokens')
-                    gemini_prompt = prompt
+
+                    gemini_messages: List[BaseMessage] = []
                     if system_prompt:
-                        gemini_prompt = f"System:\n{system_prompt.strip()}\n\nUser:\n{prompt.strip()}"
-                    response = await self.gemini_client.ainvoke(gemini_prompt, **final_params)
+                        gemini_messages.append(SystemMessage(content=system_prompt.strip()))
+
+                    user_parts: List[Dict[str, Any]] = [{"type": "text", "text": prompt.strip()}]
+                    for media in inline_media_payload:
+                        try:
+                            media_parts = media.get('parts', []) or []
+                            for part in media_parts:
+                                part_type = part.get('type')
+                                if part_type == 'text':
+                                    text_value = str(part.get('text', '')).strip()
+                                    if text_value:
+                                        user_parts.append({"type": "text", "text": text_value})
+                                elif part_type == 'media':
+                                    source = part.get('source') or {}
+                                    url = source.get('url')
+                                    if url:
+                                        # Gemini expects web images as "image_url" entries when provided via LangChain messages
+                                        user_parts.append({"type": "image_url", "image_url": {"url": str(url)}})
+                        except Exception as media_error:
+                            logger.error(
+                                f"Failed to attach inline media to Gemini request: {media_error}",
+                                exc_info=True,
+                            )
+
+                    gemini_messages.append(HumanMessage(content=user_parts))
+
+                    response = await self.gemini_client.ainvoke(gemini_messages, **final_params)
                     logger.info(f"Successfully generated text using Gemini model '{model_to_use}'.")
-                    return response.content if hasattr(response, 'content') else str(response)
+                    if isinstance(response, AIMessage):
+                        return response.content
+                    if hasattr(response, 'content'):
+                        return response.content
+                    return str(response)
 
                 elif service_name == 'azure' and self.azure_openai_client:
                     deployment_name = final_params.pop(
@@ -65,10 +138,16 @@ class TextGenerator:
                     if not deployment_name:
                         logger.error("Azure deployment name not specified for Azure OpenAI call.")
                         continue
-                    built_messages = messages if messages is not None else (
-                        ([{"role": "system", "content": system_prompt}] if system_prompt else [])
-                        + [{"role": "user", "content": prompt}]
-                    )
+                    built_messages = messages[:] if messages is not None else []
+                    if messages is None and system_prompt:
+                        built_messages.append({"role": "system", "content": system_prompt})
+
+                    user_content = _build_user_content(prompt, inline_media_payload)
+                    if messages is None:
+                        built_messages.append({"role": "user", "content": user_content})
+                    else:
+                        built_messages.append({"role": "user", "content": user_content})
+
                     response = await self.azure_openai_client.chat.completions.create(
                         model=deployment_name,
                         messages=built_messages,
@@ -79,10 +158,13 @@ class TextGenerator:
 
                 elif service_name == 'openai' and self.openai_client:
                     model_to_use = final_params.pop('model', service_config.get('model', 'gpt-3.5-turbo'))
-                    built_messages = messages if messages is not None else (
-                        ([{"role": "system", "content": system_prompt}] if system_prompt else [])
-                        + [{"role": "user", "content": prompt}]
-                    )
+                    built_messages = messages[:] if messages is not None else []
+                    if messages is None and system_prompt:
+                        built_messages.append({"role": "system", "content": system_prompt})
+
+                    user_content = _build_user_content(prompt, inline_media_payload)
+                    built_messages.append({"role": "user", "content": user_content})
+
                     response = await self.openai_client.chat.completions.create(
                         model=model_to_use,
                         messages=built_messages,

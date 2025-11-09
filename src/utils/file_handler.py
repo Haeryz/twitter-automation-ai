@@ -5,7 +5,12 @@ import csv
 import json
 from pathlib import Path
 from typing import Set, List, Optional, Dict, Any
-from datetime import datetime, timezone # Added datetime and timezone
+from datetime import datetime, timezone, date # Added date for JSON encoding helpers
+
+try: # Optional import for better serialization of Pydantic types
+    from pydantic.json import pydantic_encoder as _pydantic_encoder
+except ImportError: # pragma: no cover - fallback when Pydantic is unavailable
+    _pydantic_encoder = None
 
 # Adjust import path for ConfigLoader and setup_logger
 try:
@@ -229,12 +234,30 @@ class FileHandler:
             logger.error(f"Error reading JSON file {file_path}: {e}")
             return None
 
+    @staticmethod
+    def _json_default_encoder(obj: Any) -> Any:
+        """Fallback encoder for JSON serialization of common non-serializable objects."""
+        if _pydantic_encoder is not None:
+            try:
+                return _pydantic_encoder(obj)
+            except TypeError:
+                pass
+
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, (set, tuple)):
+            return list(obj)
+
+        return str(obj)
+
     def write_json(self, file_path: Path, data: Dict[str, Any], indent: int = 4) -> bool:
         """Writes data to a JSON file. Ensures directory exists."""
         try:
             self.ensure_directory_exists(file_path.parent)
             with file_path.open('w', encoding='utf-8') as file:
-                json.dump(data, file, indent=indent, ensure_ascii=False)
+                json.dump(data, file, indent=indent, ensure_ascii=False, default=self._json_default_encoder)
             logger.debug(f"Successfully wrote JSON to file: {file_path}")
             return True
         except Exception as e:

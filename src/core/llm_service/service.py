@@ -54,6 +54,7 @@ class LLMService:
         system_prompt: Optional[str] = None,
         few_shots: Optional[List[Tuple[str, Dict[str, Any]]]] = None,
         hard_character_limit: Optional[int] = None,
+        inline_media: Optional[List[Dict[str, Any]]] = None,
         **call_params: Any,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """
@@ -79,6 +80,7 @@ class LLMService:
                 prompt=prompt,
                 service_preference=service_preference,
                 system_prompt=system_prompt,
+                inline_media=inline_media,
                 **call_params,
             )
             if not text:

@@ -8,3 +8,5 @@ requests
 python-dotenv
 undetected-chromedriver
 selenium-stealth
+pytest
+pytest-asyncio

@@ -60,7 +60,7 @@ def initialize_clients(config_loader: ConfigLoader) -> Tuple[Dict[str, Any], Dic
         gemini_api_key = api_keys.get('gemini_api_key')
         if _is_api_key_valid('gemini_api_key', gemini_api_key):
             try:
-                model_name = gemini_config.get('model', 'gemini-2.5-flash')
+                model_name = gemini_config.get('model', 'gemini-2.5-pro')
                 gemini_client = ChatGoogleGenerativeAI(
                     model=model_name,
                     api_key=SecretStr(gemini_api_key) if SecretStr else gemini_api_key,

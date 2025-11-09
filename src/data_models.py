@@ -19,6 +19,14 @@ class LLMSettings(BaseModel):
     temperature: Optional[float] = 0.7
     # Add other common LLM parameters as needed
 
+
+def _default_llm_settings() -> "LLMSettings":
+    return LLMSettings(service_preference=None, model_name_override=None, max_tokens=150, temperature=0.7)
+
+
+def _default_thread_analysis_llm_settings() -> "LLMSettings":
+    return LLMSettings(max_tokens=70, temperature=0.2, service_preference='gemini', model_name_override=None)
+
 class ActionConfig(BaseModel): # This can be global or per-account
     # General action timing
     min_delay_between_actions_seconds: int = Field(60, description="Minimum delay between any two actions for an account.")
@@ -34,6 +42,24 @@ class ActionConfig(BaseModel): # This can be global or per-account
     prompt_for_quote_tweet_from_competitor: str = Field(
         "Write an insightful comment to quote this tweet by {user_handle}: '{tweet_text}'. Add relevant hashtags.",
         description="Prompt template for generating quote tweet text for competitor's tweet. Use {user_handle} and {tweet_text}."
+    )
+
+    # Home timeline reply controls
+    enable_home_timeline_replies: Optional[bool] = Field(
+        None,
+        description="Enable replying to tweets from the logged-in account's home timeline. None falls back to enable_competitor_reposts.",
+    )
+    home_timeline_replies_per_hour: int = Field(
+        10,
+        description="Maximum number of replies to send from the home timeline within a single hour window.",
+    )
+    home_timeline_max_hours: int = Field(
+        3,
+        description="Maximum number of hours to continue home timeline replies during one session.",
+    )
+    style_prompt_template: Optional[str] = Field(
+        None,
+        description="Custom template for constructing the style system prompt. Supports formatting keys: {handle}, {style_context}, {media_references}, {account_id}.",
     )
 
     # Keyword Reply specific controls
@@ -60,10 +86,10 @@ class ActionConfig(BaseModel): # This can be global or per-account
     enable_thread_analysis: bool = Field(True, description="Enable LLM-based analysis to identify if a tweet is part of a thread.")
 
     # LLM settings for different actions
-    llm_settings_for_post: LLMSettings = Field(default_factory=LLMSettings)
-    llm_settings_for_reply: LLMSettings = Field(default_factory=LLMSettings)
+    llm_settings_for_post: LLMSettings = Field(default_factory=_default_llm_settings)
+    llm_settings_for_reply: LLMSettings = Field(default_factory=_default_llm_settings)
     llm_settings_for_thread_analysis: LLMSettings = Field(
-        default_factory=lambda: LLMSettings(max_tokens=70, temperature=0.2, service_preference='gemini') # Default to Gemini for this task
+        default_factory=_default_thread_analysis_llm_settings # Default to Gemini for this task
     )
 
     # Optional per-account analysis and decision overrides (inherit from global when None)
@@ -198,37 +224,3 @@ class GlobalSettings(BaseModel):
     browser_settings: Dict[str, Any]
 
 
-if __name__ == '__main__':
-    # Example usage:
-    cookie_example = AccountCookie(name="auth_token", value="somevalue", domain=".x.com")
-    llm_pref_example = LLMSettings(service_preference="azure", model_name_override="gpt-4o-custom-deployment")
-    
-    action_override_example = ActionConfig(
-        enable_competitor_reposts=False, 
-        min_delay_between_actions_seconds=30
-    )
-    
-    account_example = AccountConfig(
-        account_id="user123", 
-        cookies=[cookie_example],
-        competitor_profiles=["https://x.com/anotherprofile"], # Changed from _override
-        llm_settings_override=llm_pref_example,
-        action_config=action_override_example # Changed from _override
-    )
-    print("AccountConfig Example:")
-    print(account_example.model_dump_json(indent=2))
-
-    tweet_example = ScrapedTweet(
-        tweet_id="12345",
-        user_name="Test User",
-        user_handle="@testuser",
-        text_content="This is a test tweet! (1/2)",
-        tweet_url="https://x.com/testuser/status/12345",
-        is_thread_candidate=True
-    )
-    print("\nScrapedTweet Example:")
-    print(tweet_example.model_dump_json(indent=2))
-
-    default_action_config = ActionConfig()
-    print("\nDefault ActionConfig Example:")
-    print(default_action_config.model_dump_json(indent=2))

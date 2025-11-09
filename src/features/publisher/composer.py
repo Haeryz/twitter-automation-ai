@@ -23,6 +23,14 @@ def post_new_tweet(
     tweet_text: str,
     final_media_paths: List[str],
 ) -> bool:
+    # Chromedriver 142 still throws on non-BMP characters (e.g. some emojis). Strip them early.
+    def _strip_non_bmp(text: str) -> str:
+        if not text:
+            return ""
+        cleaned = "".join(ch for ch in text if ord(ch) <= 0xFFFF)
+        if cleaned != text:
+            logger.warning("Removed characters outside BMP from tweet text to avoid ChromeDriver crash.")
+        return cleaned
     # X constraints: up to 4 images OR 1 video; don't mix types.
     def _filter_media_paths_for_x(paths: List[str]) -> List[str]:
         if not paths:
@@ -124,7 +132,7 @@ def post_new_tweet(
             logger.error("Composer textarea not found after audience selection.")
             return False
         # Ensure tweet text respects platform cap
-        safe_tweet_text = (tweet_text or "")[:270]
+        safe_tweet_text = _strip_non_bmp((tweet_text or "")[:270])
         try:
             text_area.click()
             text_area.send_keys(Keys.CONTROL, "a")

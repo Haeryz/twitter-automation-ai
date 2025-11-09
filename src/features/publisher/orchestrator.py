@@ -57,7 +57,7 @@ class TweetPublisher:
         )
 
     async def reply_to_tweet(self, original_tweet: ScrapedTweet, reply_text: str) -> bool:
-        return do_reply(self.browser_manager, original_tweet, reply_text)
+        return do_reply(self.browser_manager, original_tweet, reply_text, self.account_config)
 
     async def retweet_tweet(
         self,

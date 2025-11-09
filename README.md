@@ -117,6 +117,29 @@ twitter-automation-ai/
 
 Follow these steps to set up and run the project:
 
+### Quick Setup (Automated)
+
+After cloning the repository, run the setup script to automatically create configuration files from templates:
+
+**Windows (PowerShell):**
+```powershell
+.\setup.ps1
+```
+
+**Linux/macOS:**
+```bash
+python setup.py
+```
+
+The setup script will:
+- Create `config/accounts.json` and `config/settings.json` from templates
+- Verify and create required directories
+- Display next steps for configuration
+
+### Manual Setup
+
+If you prefer manual setup or the automated script doesn't work:
+
 ### Presets (Beginner-Friendly)
 
 Quick-start templates are available in `presets/`.
@@ -132,9 +155,11 @@ Quick-start templates are available in `presets/`.
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/ihuzaifashoukat/twitter-automation-ai
+git clone https://github.com/yourusername/twitter-automation-ai
 cd twitter-automation-ai
 ```
+
+**⚠️ IMPORTANT:** After cloning, run the setup script (see Quick Setup above) before proceeding.
 
 ### 2. Create Virtual Environment
 
@@ -158,7 +183,11 @@ pip install -r requirements.txt
 
 ### 4. Configure Accounts (`config/accounts.json`)
 
+**Note:** This file is created from `config/accounts.json.template` by the setup script.
+
 This file manages individual Twitter account configurations. It should be an array of account objects.
+
+**⚠️ SECURITY WARNING:** This file contains sensitive data and should NEVER be committed to Git. It's already listed in `.gitignore`.
 
 *   **Key Fields per Account:**
     *   `account_id`: A unique identifier for the account.
@@ -196,7 +225,11 @@ This file manages individual Twitter account configurations. It should be an arr
 
 ### 5. Configure Global Settings (`config/settings.json`)
 
+**Note:** This file is created from `config/settings.json.template` by the setup script.
+
 This file contains global configurations for the application.
+
+**⚠️ SECURITY WARNING:** This file contains API keys and should NEVER be committed to Git. It's already listed in `.gitignore`.
 
 *   **Key Sections:**
     *   `api_keys`: Store API keys for LLM services (e.g., `openai_api_key`, `gemini_api_key`).
